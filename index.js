@@ -2,7 +2,7 @@
 'use strict'
 
 const events = require('events')
-const Util = require('./lib/util')
+const lib = require('./lib')
 
 /**
  * The Trails Application. Merges the configuration and API resources
@@ -10,11 +10,26 @@ const Util = require('./lib/util')
  */
 module.exports = class TrailsApp extends events.EventEmitter {
 
+  /**
+   * @param app.api The application api (api/ folder)
+   * @param app.config The application configuration (config/ folder)
+   * @param app.pkg The application package.json
+   *
+   * Initialize the Trails Application and its EventEmitter parentclass. Set
+   * some necessary default configuration.
+   */
   constructor (app) {
     super()
 
-    // set correct environment
-    process.env.NODE_ENV || (process.env.NODE_ENV = 'development')
+    if (!process.env.NODE_ENV) {
+      process.env.NODE_ENV = 'development'
+    }
+    if (!app.config.main.paths) {
+      app.config.main.paths = { }
+    }
+    if (!app.config.main.paths.root) {
+      app.config.main.paths.root = process.cwd()
+    }
 
     this.pkg = app.pkg
     this.config = app.config
@@ -26,9 +41,8 @@ module.exports = class TrailsApp extends events.EventEmitter {
   }
 
   /**
-   * Bind trailpack listeners to "this". Trailpacks are loaded in order,
-   * according to which events they listen for and emit. This metadata
-   * are configured in the trailpack's config in the "events" section.
+   * Trailpacks are loaded in order, according to which events they listen for
+   * and emit.
    */
   bindTrailpackListeners (packs) {
     this.bindTrailpackPhaseListeners(packs)
@@ -51,12 +65,12 @@ module.exports = class TrailsApp extends events.EventEmitter {
     packs.map(pack => {
       const lifecycle = pack.config.lifecycle
 
-      this.after(lifecycle.configure.listen.concat([ 'trailpack:all:validated' ]))
+      this.after(lifecycle.configure.listen.concat('trailpack:all:validated'))
         .then(() => pack.configure())
         .then(() => this.emit(`trailpack:${pack.name}:configured`))
         .catch(err => this.stop(err))
 
-      this.after(lifecycle.initialize.listen.concat([ 'trailpack:all:configured' ]))
+      this.after(lifecycle.initialize.listen.concat('trailpack:all:configured'))
         .then(() => pack.initialize())
         .then(() => this.emit(`trailpack:${pack.name}:initialized`))
         .catch(err => this.stop(err))
@@ -69,7 +83,7 @@ module.exports = class TrailsApp extends events.EventEmitter {
   validateTrailpacks (packs) {
     return Promise.all(packs.map(pack => pack.validate()))
       .then(() => {
-        this.packs = Util.getTrailpackMapping(packs)
+        this.packs = lib.Util.getTrailpackMapping(packs)
 
         this.log.verbose('Trailpacks: All Validated.')
         this.emit('trailpack:all:validated')
@@ -81,11 +95,11 @@ module.exports = class TrailsApp extends events.EventEmitter {
    * Start the App. Load and execute all Trailpacks.
    */
   start () {
-    const filteredPacks = Util.filterTrailpacks(this)
+    const instantiatedPacks = this.config.main.packs.map(Pack => new Pack(this))
 
     this.bindEvents()
-    this.bindTrailpackListeners(filteredPacks)
-    this.validateTrailpacks(filteredPacks)
+    this.bindTrailpackListeners(instantiatedPacks)
+    this.validateTrailpacks(instantiatedPacks)
 
     this.emit('trails:start')
     return this.after('trails:ready')
@@ -95,12 +109,19 @@ module.exports = class TrailsApp extends events.EventEmitter {
    * Shutdown.
    */
   stop (err) {
-    console.log()
-    if (err) this.log.error(err.stack)
+    if (err) this.log.error('\n', err.stack)
     this.emit('trails:stop')
+
+    const unloadPromises = Object.keys(this.packs).map(packName => {
+      const pack = this.packs[packName]
+      return pack.unload()
+    })
+
     this.removeAllListeners()
-    process.removeAllListeners()
-    process.exit(err ? 1 : 0)
+    process.removeAllListeners('exit')
+    process.removeAllListeners('uncaughtException')
+
+    return Promise.all(unloadPromises)
   }
 
   /**
@@ -109,12 +130,11 @@ module.exports = class TrailsApp extends events.EventEmitter {
    */
   emit (event) {
     this.log.debug('trails event:', event)
-    const argv = arguments
 
     // allow errors to escape and be printed on exit
     // XXX this might only be needed because I don't have all the escape hatches
     // covered that errors can escape out of
-    process.nextTick(() => super.emit.apply(this, argv))
+    process.nextTick(() => super.emit.apply(this, arguments))
   }
 
   /**
@@ -131,7 +151,7 @@ module.exports = class TrailsApp extends events.EventEmitter {
   }
 
   /**
-   * Expose winston logger on global app object
+   * Expose winston logger on app object.
    */
   get log() {
     return this.config.log.logger
@@ -150,7 +170,7 @@ module.exports = class TrailsApp extends events.EventEmitter {
     this.once('trails:error:fatal', err => this.stop(err))
 
     process.on('exit', () => {
-      this.log.warn('Event loop is empty. I have nothing else to do. Shutting down')
+      this.log.verbose('Event loop is empty. I have nothing else to do. Shutting down')
     })
     process.on('uncaughtException', err => this.stop(err))
 
